@@ -38,7 +38,8 @@ ALTER TABLE solicitudes
       'ANULACION_PEDIDO',
       'MODIFICACION',
       'DESCUENTO_GLOBAL',
-      'ACCESO_DISPOSITIVO'
+      'ACCESO_DISPOSITIVO',
+      'ACCESO_JORNADA'
     )
   );
 
@@ -73,6 +74,26 @@ ALTER TABLE asistencia
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_asistencia_usuario_local_jornada
   ON asistencia (id_usuario, id_local, jornada_fecha);
+
+CREATE TABLE IF NOT EXISTS jornada_accesos (
+  id_jornada_acceso SERIAL PRIMARY KEY,
+  id_usuario INTEGER NOT NULL REFERENCES usuarios(id_usuario),
+  id_local INTEGER NOT NULL REFERENCES locales(id_local),
+  id_dispositivo INTEGER REFERENCES dispositivos_autorizados(id_dispositivo),
+  id_solicitud INTEGER REFERENCES solicitudes(id_solicitud) ON DELETE SET NULL,
+  jornada_fecha DATE NOT NULL,
+  estado VARCHAR(20) NOT NULL DEFAULT 'PENDIENTE',
+  metodo VARCHAR(30) NOT NULL DEFAULT 'PIN',
+  nombre_equipo TEXT,
+  id_usuario_autorizador INTEGER REFERENCES usuarios(id_usuario),
+  solicitado_en TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  autorizado_en TIMESTAMP WITHOUT TIME ZONE,
+  actualizado_en TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (id_usuario, id_local, jornada_fecha)
+);
+
+CREATE INDEX IF NOT EXISTS idx_jornada_accesos_local_estado
+  ON jornada_accesos (id_local, estado, jornada_fecha DESC);
 
 CREATE TABLE IF NOT EXISTS requerimientos (
   id_requerimiento SERIAL PRIMARY KEY,

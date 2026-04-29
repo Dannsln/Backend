@@ -75,7 +75,7 @@ const resolver = async ({ id_solicitud, id_local, id_usuario_resolutor, decision
 
     // Aplicar efecto si fue aprobado
     if (decision === 'APROBADO') {
-      await aplicarEfecto(client, sol);
+      await aplicarEfecto(client, sol, id_usuario_resolutor);
     } else if (sol.tipo === 'ACCESO_DISPOSITIVO') {
       const payload = parsePayload(sol.payload);
       if (payload.id_dispositivo) {
@@ -84,6 +84,17 @@ const resolver = async ({ id_solicitud, id_local, id_usuario_resolutor, decision
           SET estado = 'REVOCADO', actualizado_en = CURRENT_TIMESTAMP
           WHERE id_dispositivo = $1
         `, [payload.id_dispositivo]);
+      }
+    } else if (sol.tipo === 'ACCESO_JORNADA') {
+      const payload = parsePayload(sol.payload);
+      if (payload.id_jornada_acceso) {
+        await client.query(`
+          UPDATE jornada_accesos
+          SET estado = 'RECHAZADO',
+              id_usuario_autorizador = $1,
+              actualizado_en = CURRENT_TIMESTAMP
+          WHERE id_jornada_acceso = $2
+        `, [id_usuario_resolutor, payload.id_jornada_acceso]);
       }
     }
 
@@ -109,7 +120,7 @@ const parsePayload = (payload) => {
   return payload;
 };
 
-const aplicarEfecto = async (client, solicitud) => {
+const aplicarEfecto = async (client, solicitud, id_usuario_resolutor) => {
   const { tipo, id_pedido } = solicitud;
   const payload = parsePayload(solicitud.payload);
 
@@ -121,6 +132,19 @@ const aplicarEfecto = async (client, solicitud) => {
         SET estado = 'APROBADO', actualizado_en = CURRENT_TIMESTAMP
         WHERE id_dispositivo = $1
       `, [payload.id_dispositivo]);
+      break;
+    }
+
+    case 'ACCESO_JORNADA': {
+      if (!payload.id_jornada_acceso) throw new Error('Solicitud de jornada sin id_jornada_acceso');
+      await client.query(`
+        UPDATE jornada_accesos
+        SET estado = 'APROBADO',
+            id_usuario_autorizador = $1,
+            autorizado_en = CURRENT_TIMESTAMP,
+            actualizado_en = CURRENT_TIMESTAMP
+        WHERE id_jornada_acceso = $2
+      `, [id_usuario_resolutor, payload.id_jornada_acceso]);
       break;
     }
 

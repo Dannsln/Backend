@@ -8,7 +8,9 @@ const JWT_SECRET = process.env.JWT_SECRET || 'CAMBIA_ESTO_EN_PRODUCCION';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '30h';
 const NOMBRE_CLAVE_SECRET = process.env.NOMBRE_CLAVE_SECRET || process.env.ALIAS_SECRET || JWT_SECRET;
 const ACCESS_REQUEST_TYPE = 'ACCESO_DISPOSITIVO';
+const JORNADA_REQUEST_TYPE = 'ACCESO_JORNADA';
 const JORNADA_CUTOFF_HOUR = Number(process.env.JORNADA_CUTOFF_HOUR || 6);
+const JORNADA_REQUIERE_APROBACION = process.env.JORNADA_REQUIERE_APROBACION !== 'false';
 
 let schemaReady = false;
 
@@ -119,7 +121,8 @@ const ensureAuthSchema = async () => {
         'ANULACION_PEDIDO',
         'MODIFICACION',
         'DESCUENTO_GLOBAL',
-        'ACCESO_DISPOSITIVO'
+        'ACCESO_DISPOSITIVO',
+        'ACCESO_JORNADA'
       ))
   `);
   await db.query(`
@@ -155,6 +158,28 @@ const ensureAuthSchema = async () => {
   await db.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS uq_asistencia_usuario_local_jornada
       ON asistencia (id_usuario, id_local, jornada_fecha)
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS jornada_accesos (
+      id_jornada_acceso SERIAL PRIMARY KEY,
+      id_usuario INTEGER NOT NULL REFERENCES usuarios(id_usuario),
+      id_local INTEGER NOT NULL REFERENCES locales(id_local),
+      id_dispositivo INTEGER REFERENCES dispositivos_autorizados(id_dispositivo),
+      id_solicitud INTEGER REFERENCES solicitudes(id_solicitud) ON DELETE SET NULL,
+      jornada_fecha DATE NOT NULL,
+      estado VARCHAR(20) NOT NULL DEFAULT 'PENDIENTE',
+      metodo VARCHAR(30) NOT NULL DEFAULT 'PIN',
+      nombre_equipo TEXT,
+      id_usuario_autorizador INTEGER REFERENCES usuarios(id_usuario),
+      solicitado_en TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      autorizado_en TIMESTAMP WITHOUT TIME ZONE,
+      actualizado_en TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (id_usuario, id_local, jornada_fecha)
+    )
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_jornada_accesos_local_estado
+      ON jornada_accesos (id_local, estado, jornada_fecha DESC)
   `);
   schemaReady = true;
 };
@@ -356,6 +381,126 @@ const jornadaActual = () => {
   return now.toISOString().slice(0, 10);
 };
 
+const crearSolicitudJornada = async ({ acceso, id_local, id_usuario, metodo, dispositivo, nombre_equipo }) => {
+  const payload = {
+    id_jornada_acceso: acceso.id_jornada_acceso,
+    jornada_fecha: acceso.jornada_fecha,
+    metodo,
+    id_dispositivo: dispositivo?.id_dispositivo || null,
+    nombre_equipo: nombre_equipo || dispositivo?.nombre_equipo || null,
+  };
+
+  const existing = await db.query(`
+    SELECT id_solicitud
+    FROM solicitudes
+    WHERE id_local = $1
+      AND id_usuario_origen = $2
+      AND tipo = $3
+      AND estado = 'PENDIENTE'
+      AND payload->>'id_jornada_acceso' = $4
+    LIMIT 1
+  `, [id_local, id_usuario, JORNADA_REQUEST_TYPE, String(acceso.id_jornada_acceso)]);
+
+  if (existing.rows.length) return existing.rows[0];
+
+  const { rows } = await db.query(`
+    INSERT INTO solicitudes (id_local, id_usuario_origen, tipo, payload)
+    VALUES ($1, $2, $3, $4)
+    RETURNING *
+  `, [id_local, id_usuario, JORNADA_REQUEST_TYPE, JSON.stringify(payload)]);
+
+  await db.query(`
+    UPDATE jornada_accesos
+    SET id_solicitud = $1,
+        actualizado_en = CURRENT_TIMESTAMP
+    WHERE id_jornada_acceso = $2
+  `, [rows[0].id_solicitud, acceso.id_jornada_acceso]);
+
+  try {
+    emitToLocal(id_local, Eventos.SOLICITUD_NUEVA, rows[0]);
+  } catch (err) {
+    console.warn('[Auth] No se pudo emitir solicitud de jornada:', err.message);
+  }
+
+  return rows[0];
+};
+
+const verificarAccesoJornada = async ({ usuario, dispositivo, metodo, nombre_equipo, esAdmin }) => {
+  if (!JORNADA_REQUIERE_APROBACION || esAdmin) return { ok: true };
+
+  const jornada = jornadaActual();
+  const existing = await db.query(`
+    SELECT *
+    FROM jornada_accesos
+    WHERE id_usuario = $1
+      AND id_local = $2
+      AND jornada_fecha = $3
+    LIMIT 1
+  `, [usuario.id_usuario, usuario.id_local, jornada]);
+
+  let acceso = existing.rows[0] || null;
+
+  if (acceso?.estado === 'APROBADO') return { ok: true };
+  if (acceso?.estado === 'RECHAZADO') {
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        estado: 'JORNADA_RECHAZADA',
+        mensaje: 'El administrador rechazo tu acceso para esta jornada.',
+      },
+    };
+  }
+
+  if (!acceso) {
+    const { rows } = await db.query(`
+      INSERT INTO jornada_accesos (
+        id_usuario, id_local, id_dispositivo, jornada_fecha, estado, metodo, nombre_equipo
+      )
+      VALUES ($1, $2, $3, $4, 'PENDIENTE', $5, $6)
+      RETURNING *
+    `, [
+      usuario.id_usuario,
+      usuario.id_local,
+      dispositivo?.id_dispositivo || null,
+      jornada,
+      metodo,
+      nombre_equipo || dispositivo?.nombre_equipo || null,
+    ]);
+    acceso = rows[0];
+  } else {
+    const { rows } = await db.query(`
+      UPDATE jornada_accesos
+      SET id_dispositivo = COALESCE($1, id_dispositivo),
+          metodo = $2,
+          nombre_equipo = COALESCE($3, nombre_equipo),
+          actualizado_en = CURRENT_TIMESTAMP
+      WHERE id_jornada_acceso = $4
+      RETURNING *
+    `, [dispositivo?.id_dispositivo || null, metodo, nombre_equipo || dispositivo?.nombre_equipo || null, acceso.id_jornada_acceso]);
+    acceso = rows[0];
+  }
+
+  await crearSolicitudJornada({
+    acceso,
+    id_local: usuario.id_local,
+    id_usuario: usuario.id_usuario,
+    metodo,
+    dispositivo,
+    nombre_equipo,
+  });
+
+  return {
+    ok: false,
+    status: 403,
+    body: {
+      estado: 'JORNADA_PENDIENTE',
+      mensaje: 'Tu acceso para esta jornada esta pendiente de aprobacion del administrador.',
+      jornada_fecha: jornada,
+    },
+  };
+};
+
 const registrarAsistencia = async ({ id_usuario, id_local, metodo, id_dispositivo }) => {
   try {
     await ensureAuthSchema();
@@ -541,11 +686,23 @@ const iniciarSesion = async (req, res) => {
       }
     }
 
+    const metodoLogin = usaBiometria ? 'BIOMETRICO' : 'PIN';
+    const jornada = await verificarAccesoJornada({
+      usuario: { ...usuario, roles },
+      dispositivo,
+      metodo: metodoLogin,
+      nombre_equipo,
+      esAdmin,
+    });
+    if (!jornada.ok) {
+      return res.status(jornada.status || 403).json(jornada.body);
+    }
+
     const token = generarToken({ ...usuario, id_dispositivo: dispositivo.id_dispositivo });
     await registrarAsistencia({
       id_usuario,
       id_local,
-      metodo: usaBiometria ? 'BIOMETRICO' : 'PIN',
+      metodo: metodoLogin,
       id_dispositivo: dispositivo.id_dispositivo,
     });
 
